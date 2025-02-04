@@ -100,6 +100,12 @@ app.post(
 
       const endTime = performance.now();
 
+      console.log({
+        similarity: distance,
+        percentage: (1 - distance) * 100,
+        executionTimeMs: endTime - startTime,
+      });
+
       res.json({
         similarity: distance,
         percentage: (1 - distance) * 100,
