@@ -3,9 +3,15 @@ import multer from "multer";
 import faceapi from "face-api.js";
 import path from "path";
 import canvas from "canvas";
-import { performance } from "perf_hooks";
+import cors from "cors";
+import { randomUUID } from "crypto";
 
 const app = express();
+app.use(cors());
+
+// Store jobs in memory (consider using Redis in production)
+const jobs = new Map();
+
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
@@ -42,12 +48,79 @@ async function initializeModels() {
   console.log("Models loaded successfully");
 }
 
+// Process face comparison
+async function processFaceComparison(jobId, referenceBuffer, queryBuffer) {
+  try {
+    // Update job status
+    updateJobStatus(jobId, "loading_images", "Loading images...");
+
+    const referenceImg = await canvas.loadImage(referenceBuffer);
+    const queryImg = await canvas.loadImage(queryBuffer);
+
+    updateJobStatus(jobId, "detecting_faces", "Detecting faces...");
+
+    const faceDetectionOptions = getFaceDetectorOptions(faceDetectionNet);
+
+    const idDetection = await faceapi
+      .detectSingleFace(referenceImg, faceDetectionOptions)
+      .withFaceLandmarks()
+      .withFaceDescriptor();
+
+    const selfieDetection = await faceapi
+      .detectSingleFace(queryImg, faceDetectionOptions)
+      .withFaceLandmarks()
+      .withFaceDescriptor();
+
+    if (!idDetection || !selfieDetection) {
+      updateJobStatus(
+        jobId,
+        "error",
+        "Could not detect faces in one or both images"
+      );
+      return;
+    }
+
+    updateJobStatus(jobId, "comparing", "Comparing faces...");
+
+    const distance = faceapi.euclideanDistance(
+      idDetection.descriptor,
+      selfieDetection.descriptor
+    );
+
+    // Complete job with results
+    updateJobStatus(jobId, "completed", "Comparison completed", {
+      percentage: (1 - distance) * 100,
+      similarity: distance,
+    });
+  } catch (error) {
+    console.error("Error processing images:", error);
+    updateJobStatus(jobId, "error", error.message);
+  }
+}
+
+function updateJobStatus(jobId, status, message, results = null) {
+  const job = jobs.get(jobId);
+  if (job) {
+    job.status = status;
+    job.message = message;
+    job.results = results;
+    job.updatedAt = new Date();
+
+    // Clean up completed or errored jobs after 5 minutes
+    if (status === "completed" || status === "error") {
+      setTimeout(() => {
+        jobs.delete(jobId);
+      }, 5 * 60 * 1000);
+    }
+  }
+}
+
+// API endpoints
 // Health check endpoint
 app.get("/health", (req, res) => {
   res.json({ status: "ok" });
 });
 
-// Face comparison endpoint
 app.post(
   "/compare",
   upload.fields([
@@ -56,8 +129,6 @@ app.post(
   ]),
   async (req, res) => {
     try {
-      const startTime = performance.now();
-
       if (
         !req.files ||
         !("reference" in req.files) ||
@@ -69,65 +140,47 @@ app.post(
       }
 
       const files = req.files;
+      const jobId = randomUUID();
 
-      // Load images from buffers
-      const referenceImg = await canvas.loadImage(files.reference[0].buffer);
-      const queryImg = await canvas.loadImage(files.query[0].buffer);
+      // Create job
+      jobs.set(jobId, {
+        id: jobId,
+        status: "pending",
+        message: "Job created",
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
 
-      const faceDetectionOptions = getFaceDetectorOptions(faceDetectionNet);
-
-      // Detect faces and get descriptors
-      const idDetection = await faceapi
-        .detectSingleFace(referenceImg, faceDetectionOptions)
-        .withFaceLandmarks()
-        .withFaceDescriptor();
-
-      const selfieDetection = await faceapi
-        .detectSingleFace(queryImg, faceDetectionOptions)
-        .withFaceLandmarks()
-        .withFaceDescriptor();
-
-      if (!idDetection || !selfieDetection) {
-        return res.status(400).json({
-          error: "Could not detect faces in one or both images",
-        });
-      }
-
-      const distance = faceapi.euclideanDistance(
-        idDetection.descriptor,
-        selfieDetection.descriptor
+      // Process images asynchronously
+      processFaceComparison(
+        jobId,
+        files.reference[0].buffer,
+        files.query[0].buffer
       );
 
-      const endTime = performance.now();
+      console.log("JobID:", jobId);
 
-      console.log({
-        similarity: distance,
-        percentage: (1 - distance) * 100,
-        executionTimeMs: endTime - startTime,
-      });
-
-      res.json({
-        similarity: distance,
-        percentage: (1 - distance) * 100,
-        executionTimeMs: endTime - startTime,
-        referenceDetection: {
-          box: idDetection.detection.box,
-          landmarks: idDetection.landmarks.positions,
-        },
-        queryDetection: {
-          box: selfieDetection.detection.box,
-          landmarks: selfieDetection.landmarks.positions,
-        },
-      });
+      // Return job ID immediately
+      res.json({ jobId });
     } catch (error) {
-      console.error("Error processing images:", error);
+      console.error("Error initiating job:", error);
       res.status(500).json({
-        error: "Error processing images",
+        error: "Error initiating job",
         details: error.message,
       });
     }
   }
 );
+
+// Get job status endpoint (optional, since we're using WebSocket)
+app.get("/jobs/:jobId", (req, res) => {
+  const job = jobs.get(req.params.jobId);
+  if (job) {
+    res.json(job);
+  } else {
+    res.status(404).json({ error: "Job not found" });
+  }
+});
 
 // Start server
 const PORT = process.env.PORT || 3000;
